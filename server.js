@@ -1,411 +1,426 @@
-/* AudioFlow v1 (FinishFlow 동일 스택)
- * - Render Web Service (Node)
- * - GitHub Auto Deploy
- * - OpenAI API: "파라미터(안전한 사운드 레시피 JSON)"만 생성
- * - 실제 음원은 서버에서 절차적(모방 없는) 합성 → WAV 반환
- *
- * 목표: "수익형 영상 배경 부품" (튀지 않음, 멜로디 없음, 저작권 리스크 최소)
- */
+// audioflow-live/server.js
+// AudioFlow Engine v1 (stable): /make -> generates WAV + download_url
+// Principles: fixed schema, JSON-only, rate limit, no partial patching.
 
-const express = require("express");
-const crypto = require("crypto");
+import express from "express";
+import crypto from "crypto";
+import fs from "fs";
+import path from "path";
+import os from "os";
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
 
+// ---------- Config ----------
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini"; // 없으면 기본값
-const MAX_MINUTES = Number(process.env.MAX_MINUTES || 5); // Render 즉시생성은 1~5분 권장
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-// --------------------------
-// Utility
-// --------------------------
-function clamp(n, a, b) {
-  return Math.max(a, Math.min(b, n));
-}
-function nowStamp() {
-  const d = new Date();
-  const p = (x) => String(x).padStart(2, "0");
-  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-}
-function sha256(buf) {
-  return crypto.createHash("sha256").update(buf).digest("hex");
-}
-function randSeed() {
-  return crypto.randomBytes(8).readBigUInt64BE(0);
-}
+// 비용/폭주 방지
+const RATE_LIMIT_PER_MIN = parseInt(process.env.RATE_LIMIT_PER_MIN || "6", 10); // per IP
+const COOLDOWN_MS = parseInt(process.env.COOLDOWN_MS || "0", 10); // optional
+const MAX_MINUTES = parseFloat(process.env.MAX_MINUTES || "5"); // duration cap
 
-// --------------------------
-// WAV writer (PCM16 mono)
-// --------------------------
-function writeWavMono16(samples, sampleRate) {
-  const numFrames = samples.length;
-  const bytesPerSample = 2;
-  const dataSize = numFrames * bytesPerSample;
-  const buffer = Buffer.alloc(44 + dataSize);
+// CORS (UI에서 호출 가능하도록)
+const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || "*";
 
-  buffer.write("RIFF", 0);
-  buffer.writeUInt32LE(36 + dataSize, 4);
-  buffer.write("WAVE", 8);
-  buffer.write("fmt ", 12);
-  buffer.writeUInt32LE(16, 16); // PCM chunk size
-  buffer.writeUInt16LE(1, 20); // PCM
-  buffer.writeUInt16LE(1, 22); // mono
-  buffer.writeUInt32LE(sampleRate, 24);
-  buffer.writeUInt32LE(sampleRate * bytesPerSample, 28);
-  buffer.writeUInt16LE(bytesPerSample, 32);
-  buffer.writeUInt16LE(16, 34);
-  buffer.write("data", 36);
-  buffer.writeUInt32LE(dataSize, 40);
+// Files
+const OUT_DIR = path.join(os.tmpdir(), "audioflow");
+if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
 
-  let o = 44;
-  for (let i = 0; i < numFrames; i++) {
-    let s = samples[i];
-    if (s > 1) s = 1;
-    if (s < -1) s = -1;
-    const pcm = Math.round(s * 32767);
-    buffer.writeInt16LE(pcm, o);
-    o += 2;
-  }
-  return buffer;
-}
+// ---------- Middleware ----------
+app.use(express.json({ limit: "1mb" }));
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", ALLOW_ORIGIN);
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 
-function softClip(x, drive) {
-  const t = Math.tanh(x * drive);
-  const d = Math.tanh(drive);
-  return t / d;
-}
-
-// 1-pole lowpass stateful
-function makeOnePoleLP(cutoffHz, sampleRate) {
-  const a = Math.exp(-2 * Math.PI * cutoffHz / sampleRate);
-  let y = 0;
-  return (x) => {
-    y = a * y + (1 - a) * x;
-    return y;
+// ---------- Fixed Schema Helpers ----------
+function emptyData() {
+  return {
+    title: "",
+    preset: "CALM_LOOP",
+    duration_sec: 0,
+    loopable: false,
+    prompt: {
+      topic: "",
+      mood: "",
+      tempo_bpm: 0,
+      instruments: [],
+      do_not: [],
+    },
+    audio: {
+      format: "wav",
+      sample_rate: 44100,
+      bitrate_kbps: 1411,
+      file_name: "",
+      download_url: "",
+    },
+    notes: [],
   };
 }
 
-function rmsNormalize(samples, targetDb) {
-  let sum = 0;
-  for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
-  const rms = Math.sqrt(sum / samples.length + 1e-12);
-  const target = Math.pow(10, targetDb / 20);
-  let gain = target / (rms + 1e-12);
-  gain = Math.min(gain, 6);
-
-  let peak = 0;
-  for (let i = 0; i < samples.length; i++) {
-    samples[i] *= gain;
-    const a = Math.abs(samples[i]);
-    if (a > peak) peak = a;
-  }
-  if (peak > 0.99) {
-    const g2 = 0.99 / peak;
-    for (let i = 0; i < samples.length; i++) samples[i] *= g2;
-  }
-  return samples;
+function okResponse(data) {
+  return { ok: true, code: "OK", data };
 }
 
-// --------------------------
-// OpenAI: 안전한 "사운드 레시피(JSON)" 생성
-// (음원 자체를 OpenAI에서 만들지 않음 → 저작권/유사도 리스크 최소화)
-// --------------------------
-async function fetchSoundRecipe({ country, minutes }) {
-  // API 키 없으면 내부 기본 레시피 사용 (테스트는 가능)
+function errResponse(code) {
+  return { ok: false, code, data: emptyData() };
+}
+
+// ---------- Rate Limit (in-memory) ----------
+const ipBuckets = new Map(); // ip -> { tsMinute, count, lastTs }
+
+function getClientIp(req) {
+  const xf = req.headers["x-forwarded-for"];
+  if (typeof xf === "string" && xf.length > 0) return xf.split(",")[0].trim();
+  return req.socket?.remoteAddress || "unknown";
+}
+
+function rateLimitCheck(ip) {
+  const now = Date.now();
+  const minute = Math.floor(now / 60000);
+  const cur = ipBuckets.get(ip) || { tsMinute: minute, count: 0, lastTs: 0 };
+
+  // reset per minute
+  if (cur.tsMinute !== minute) {
+    cur.tsMinute = minute;
+    cur.count = 0;
+  }
+
+  // optional cooldown
+  if (COOLDOWN_MS > 0 && cur.lastTs && now - cur.lastTs < COOLDOWN_MS) {
+    return { ok: false, code: "E-RATE-001" };
+  }
+
+  cur.count += 1;
+  cur.lastTs = now;
+  ipBuckets.set(ip, cur);
+
+  if (cur.count > RATE_LIMIT_PER_MIN) return { ok: false, code: "E-RATE-001" };
+  return { ok: true };
+}
+
+// ---------- JSON extraction (defensive) ----------
+function extractJsonObject(text) {
+  if (typeof text !== "string") return null;
+  const first = text.indexOf("{");
+  const last = text.lastIndexOf("}");
+  if (first === -1 || last === -1 || last <= first) return null;
+  const slice = text.slice(first, last + 1);
+  try {
+    return JSON.parse(slice);
+  } catch {
+    return null;
+  }
+}
+
+// ---------- OpenAI (JSON plan only) ----------
+async function makeMusicPlan({ topic, preset, durationSec }) {
+  // If no key, still run with deterministic fallback (no crash)
   if (!OPENAI_API_KEY) {
     return {
-      preset_name: country === "JP" ? "JP:DarkAmbientMinimal" : "KR:MinimalTension",
-      noise_cutoff_hz: country === "JP" ? 1600 : 1800,
-      sub_hz: country === "JP" ? 42 : 45,
-      pulse_density: country === "JP" ? 0.12 : 0.15,
-      intro_sec: 2,
-      outro_sec: 3,
-      target_db: -16
+      title: `AudioFlow BGM: ${topic || "Untitled"}`,
+      preset,
+      duration_sec: durationSec,
+      loopable: preset !== "UPBEAT_SHORTS",
+      prompt: {
+        topic: topic || "",
+        mood: preset === "UPBEAT_SHORTS" ? "energetic, light, positive" : "calm, steady, unobtrusive",
+        tempo_bpm: preset === "UPBEAT_SHORTS" ? 110 : 80,
+        instruments: preset === "UPBEAT_SHORTS" ? ["soft pluck", "light percussion", "bass pad"] : ["warm pad", "soft piano", "air texture"],
+        do_not: ["no artist imitation", "no recognizable melodies", "no lyrics", "no harsh distortion"],
+      },
+      notes: ["OPENAI_API_KEY missing: used fallback plan (audio generation still works)."],
     };
   }
 
-  const system = `
-너는 음악 예술 AI가 아니라 '수익형 영상에 사용되는 저작권 무리스크 음원 생산 엔진'의 파라미터 설계자다.
-멜로디/감정 과잉/모방 금지. 오직 '튀지 않는 배경 부품' 기준으로 사운드 파라미터만 결정한다.
-반드시 JSON만 출력한다. 키는 아래만 허용:
-preset_name, noise_cutoff_hz, sub_hz, pulse_density, intro_sec, outro_sec, target_db
-값 범위:
-noise_cutoff_hz: 900~3200
-sub_hz: 35~70
-pulse_density: 0.06~0.20
-intro_sec: 1~3
-outro_sec: 2~4
-target_db: -18~-14
-`;
+  const system = [
+    "You are an audio-for-video BGM planning engine.",
+    "Return ONLY JSON. No markdown, no code fences.",
+    "Goal: produce a safe, generic, non-infringing background music plan for monetizable videos.",
+    "Do NOT imitate any artist or existing song. Avoid distinctive melodies.",
+    "Keep music unobtrusive; prioritize watch-time and focus.",
+  ].join(" ");
 
-  const user = `
-국가=${country}, 길이(분)=${minutes}.
-목표: 설명형/판단형/정보형 영상에 깔아도 메시지를 방해하지 않는 배경음.
-요구: 멜로디 없음, 저작권/유사도 리스크 최소, 장시간에서도 피로 낮음.
-`;
+  const user = {
+    topic: topic || "",
+    preset,
+    duration_sec: durationSec,
+    required_keys: [
+      "title",
+      "preset",
+      "duration_sec",
+      "loopable",
+      "prompt{topic,mood,tempo_bpm,instruments[],do_not[]}",
+      "notes[]",
+    ],
+  };
 
-  // Chat Completions 사용 (FinishFlow 스타일 유지)
+  const body = {
+    model: OPENAI_MODEL,
+    temperature: 0.2,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: JSON.stringify(user) },
+    ],
+  };
+
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      "authorization": `Bearer ${OPENAI_API_KEY}`,
-      "content-type": "application/json"
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
     },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      temperature: 0.2,
-      messages: [
-        { role: "system", content: system.trim() },
-        { role: "user", content: user.trim() }
-      ],
-      response_format: { type: "json_object" }
-    })
+    body: JSON.stringify(body),
   });
 
   if (!resp.ok) {
-    const t = await resp.text();
-    throw new Error(`OpenAI error: ${t}`);
+    const t = await resp.text().catch(() => "");
+    throw new Error(`openai_http_${resp.status}: ${t.slice(0, 200)}`);
   }
-  const data = await resp.json();
-  const txt = data?.choices?.[0]?.message?.content || "{}";
-  let parsed = {};
-  try { parsed = JSON.parse(txt); } catch { parsed = {}; }
 
-  // 안전 기본값 + 범위 클램프
-  const recipe = {
-    preset_name: String(parsed.preset_name || (country === "JP" ? "JP:DarkAmbientMinimal" : "KR:MinimalTension")),
-    noise_cutoff_hz: clamp(Number(parsed.noise_cutoff_hz || (country === "JP" ? 1600 : 1800)), 900, 3200),
-    sub_hz: clamp(Number(parsed.sub_hz || (country === "JP" ? 42 : 45)), 35, 70),
-    pulse_density: clamp(Number(parsed.pulse_density || (country === "JP" ? 0.12 : 0.15)), 0.06, 0.20),
-    intro_sec: clamp(Number(parsed.intro_sec || 2), 1, 3),
-    outro_sec: clamp(Number(parsed.outro_sec || 3), 2, 4),
-    target_db: clamp(Number(parsed.target_db || -16), -18, -14)
-  };
-
-  return recipe;
+  const json = await resp.json();
+  const content = json?.choices?.[0]?.message?.content || "";
+  const plan = extractJsonObject(content);
+  if (!plan) throw new Error("openai_parse_fail");
+  return plan;
 }
 
-// --------------------------
-// Procedural synthesis (no melody)
-// - noise texture + sub drone + very subtle pulse energy
-// - intro/outro envelope
-// - micro macro movement to avoid "static loop" feel
-// --------------------------
-function synthWav({ country, minutes, recipe }) {
-  const sampleRate = 44100;
-  minutes = clamp(minutes, 1, MAX_MINUTES);
-  const totalSec = minutes * 60;
+// ---------- WAV synthesis (no external deps) ----------
+function writeWavMono16(filePath, sampleRate, samplesInt16) {
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+  const dataSize = samplesInt16.length * 2;
 
-  const introSec = clamp(recipe.intro_sec ?? 2, 1, 3);
-  const outroSec = clamp(recipe.outro_sec ?? 3, 2, 4);
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16); // PCM
+  header.writeUInt16LE(1, 20); // format = PCM
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(dataSize, 40);
 
-  const n = totalSec * sampleRate;
-  const out = new Float32Array(n);
-
-  const lp = makeOnePoleLP(recipe.noise_cutoff_hz, sampleRate);
-
-  const subHz = recipe.sub_hz;
-  const density = recipe.pulse_density;
-
-  // deterministic-ish seed-based randomness for pulses
-  const seed = randSeed();
-  let r = Number(seed % 2147483647n);
-  function prng() {
-    // simple LCG
-    r = (r * 48271) % 2147483647;
-    return r / 2147483647;
+  const data = Buffer.alloc(dataSize);
+  for (let i = 0; i < samplesInt16.length; i++) {
+    data.writeInt16LE(samplesInt16[i], i * 2);
   }
 
-  const introS = introSec * sampleRate;
-  const outroS = outroSec * sampleRate;
+  fs.writeFileSync(filePath, Buffer.concat([header, data]));
+}
 
-  for (let i = 0; i < n; i++) {
+function clamp16(x) {
+  if (x > 32767) return 32767;
+  if (x < -32768) return -32768;
+  return x | 0;
+}
+
+function synthAmbientWav({ durationSec, preset }) {
+  const sampleRate = 44100;
+  const total = Math.max(1, Math.floor(durationSec * sampleRate));
+
+  // Preset shaping
+  const tempo =
+    preset === "UPBEAT_SHORTS" ? 110 :
+    preset === "DOCUMENTARY" ? 90 : 80;
+
+  const baseFreq =
+    preset === "UPBEAT_SHORTS" ? 220 :
+    preset === "DOCUMENTARY" ? 196 : 174;
+
+  const amp =
+    preset === "UPBEAT_SHORTS" ? 0.22 :
+    preset === "DOCUMENTARY" ? 0.18 : 0.16;
+
+  // Deterministic-ish seed
+  const seed = crypto.randomBytes(8).readUInt32LE(0);
+  let rnd = seed;
+  const rand = () => {
+    // xorshift32
+    rnd ^= rnd << 13; rnd ^= rnd >>> 17; rnd ^= rnd << 5;
+    return (rnd >>> 0) / 4294967296;
+  };
+
+  // Simple pad: mixed sines + slow LFO + soft noise
+  const samples = new Int16Array(total);
+
+  const beatHz = tempo / 60;
+  const lfoHz = preset === "UPBEAT_SHORTS" ? 0.35 : 0.18;
+
+  const freqs = [
+    baseFreq,
+    baseFreq * 1.25,
+    baseFreq * 1.5,
+    baseFreq * 2.0,
+  ];
+
+  let phase = freqs.map(() => rand() * Math.PI * 2);
+  let lfoPhase = rand() * Math.PI * 2;
+  let beatPhase = rand() * Math.PI * 2;
+
+  for (let i = 0; i < total; i++) {
     const t = i / sampleRate;
 
-    // noise -> LP
-    const w = prng() * 2 - 1;
-    const noise = lp(w) * 0.18;
+    // LFO for movement
+    lfoPhase += (2 * Math.PI * lfoHz) / sampleRate;
+    const lfo = 0.6 + 0.4 * Math.sin(lfoPhase);
 
-    // sub drone with slow drift (no melody)
-    const drift = 0.8 + 0.4 * Math.sin(2 * Math.PI * 0.03 * t);
-    const sub = Math.sin(2 * Math.PI * (subHz * drift) * t) * 0.10;
+    // Gentle pulse to give structure (still BGM)
+    beatPhase += (2 * Math.PI * beatHz) / sampleRate;
+    const pulse = 0.75 + 0.25 * Math.max(0, Math.sin(beatPhase));
 
-    // subtle pulse energy (not a beat)
-    const hit = (prng() < (density / sampleRate)) ? 1 : 0;
-    const pulse = hit * 0.06;
+    // ADSR-ish fade in/out
+    const fadeIn = Math.min(1, t / 1.2);
+    const fadeOut = Math.min(1, (durationSec - t) / 1.2);
+    const env = Math.max(0, Math.min(fadeIn, fadeOut));
 
-    // slow amp movement
-    const amp = 0.65 + 0.35 * Math.sin(2 * Math.PI * 0.015 * t);
+    let x = 0;
 
-    // macro drift to reduce fatigue + repetition feel
-    const macro = 0.9 + 0.1 * Math.sin(2 * Math.PI * 0.007 * t);
-
-    let s = (noise + sub + pulse) * amp * macro;
-
-    // intro/outro
-    if (i < introS) {
-      const x = i / introS;
-      s *= Math.pow(x, 1.6);
-    } else if (i > n - outroS) {
-      const x = (n - i) / outroS;
-      s *= Math.pow(x, 1.6);
+    // Sine stack
+    for (let k = 0; k < freqs.length; k++) {
+      phase[k] += (2 * Math.PI * freqs[k]) / sampleRate;
+      x += Math.sin(phase[k]) * (k === 0 ? 1.0 : 0.55 / (k));
     }
 
-    out[i] = softClip(s, 1.3);
+    // Soft noise texture
+    const noise = (rand() * 2 - 1) * 0.08;
+
+    // UPBEAT: slightly more rhythmic click-ish layer (still safe)
+    const click = preset === "UPBEAT_SHORTS"
+      ? (Math.sin(beatPhase * 4) > 0.98 ? 0.35 : 0)
+      : 0;
+
+    const y = (x * 0.55 + noise + click) * amp * lfo * pulse * env;
+
+    samples[i] = clamp16(y * 32767);
   }
 
-  rmsNormalize(out, recipe.target_db ?? -16);
-  const wav = writeWavMono16(out, sampleRate);
-  const hash = sha256(wav);
-
-  const license_proof = {
-    engine: "AudioFlow v1",
-    country,
-    minutes,
-    sample_rate: sampleRate,
-    policy: {
-      no_melody: true,
-      purpose: "revenue-video background component",
-      copyright_risk: "minimized (procedural synthesis; no imitation)"
-    },
-    recipe,
-    wav_sha256: hash,
-    created_at: nowStamp()
-  };
-
-  return { wav, license_proof };
+  return { sampleRate, samples };
 }
 
-// --------------------------
-// UI (최소 화면) + API
-// --------------------------
+// ---------- Routes ----------
+app.get("/health", (req, res) => {
+  const hasKey = !!OPENAI_API_KEY;
+  res.json({ ok: true, status: "healthy", hasOpenAIKey: hasKey });
+});
+
 app.get("/", (req, res) => {
-  res.setHeader("content-type", "text/html; charset=utf-8");
+  // 최소 UI (엔진 상태 확인용)
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.end(`
-<!doctype html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>AudioFlow v1</title>
-  <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto;max-width:720px;margin:40px auto;padding:16px}
-    .card{border:1px solid #ddd;border-radius:14px;padding:16px}
-    button{padding:12px 14px;border-radius:12px;border:1px solid #111;background:#111;color:#fff;font-size:16px;cursor:pointer}
-    input{padding:10px;font-size:16px;width:120px}
-    small{opacity:.75}
-  </style>
-</head>
-<body>
-  <h1>AudioFlow v1</h1>
-  <p><small>수익형 영상용 · 저작권 무리스크 · 배경음(멜로디 없음)</small></p>
-
-  <div class="card">
-    <h3>국가 선택</h3>
-    <label><input type="radio" name="country" value="KR" checked> 한국(KR)</label>
-    <label style="margin-left:12px;"><input type="radio" name="country" value="JP"> 일본(JP)</label>
-
-    <h3 style="margin-top:18px;">길이(분)</h3>
-    <p><small>Render 즉시 생성은 1~${MAX_MINUTES}분 권장 (장시간 60~180분은 다음 단계에서 별도 처리)</small></p>
-    <input id="min" type="number" min="1" max="${MAX_MINUTES}" value="1" />
-
-    <div style="margin-top:16px;">
-      <button id="go">음원 생성 → WAV 다운로드</button>
-    </div>
-
-    <p id="msg" style="margin-top:12px;"></p>
-  </div>
-
-<script>
-  const btn = document.getElementById('go');
-  const msg = document.getElementById('msg');
-  btn.onclick = async () =>代表 {};
-</script>
-
-<script>
-  const go = document.getElementById('go');
-  const msgEl = document.getElementById('msg');
-
-  function getCountry(){
-    const el = document.querySelector('input[name="country"]:checked');
-    return el ? el.value : 'KR';
-  }
-
-  go.onclick = async () => {
-    msgEl.textContent = '생성 중...';
-    go.disabled = true;
-    try{
-      const minutes = Number(document.getElementById('min').value || 1);
-      const country = getCountry();
-      const res = await fetch('/make', {
-        method:'POST',
-        headers:{'content-type':'application/json'},
-        body: JSON.stringify({ country, minutes })
-      });
-      if(!res.ok){
-        const t = await res.text();
-        throw new Error(t || 'failed');
-      }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'audioflow_' + country + '_' + minutes + 'm.wav';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-      msgEl.textContent = '완료: WAV 다운로드 시작됨';
-    }catch(e){
-      msgEl.textContent = '오류: ' + (e && e.message ? e.message : 'unknown');
-    }finally{
-      go.disabled = false;
-    }
-  };
-</script>
-</body>
-</html>
+    <html>
+      <head><meta charset="utf-8"/><title>AudioFlow Engine</title></head>
+      <body style="font-family:Arial; padding:24px;">
+        <h2>AudioFlow Engine v1</h2>
+        <p>POST <code>/make</code> to generate a WAV and get download_url.</p>
+        <p>GET <code>/health</code> for healthcheck.</p>
+      </body>
+    </html>
   `);
 });
 
-app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/download/:file", (req, res) => {
+  try {
+    const file = req.params.file || "";
+    const safe = path.basename(file);
+    const full = path.join(OUT_DIR, safe);
+    if (!fs.existsSync(full)) return res.status(404).json(errResponse("E-SERVER-001"));
+    res.setHeader("Content-Type", "audio/wav");
+    res.setHeader("Content-Disposition", `attachment; filename="${safe}"`);
+    fs.createReadStream(full).pipe(res);
+  } catch {
+    return res.status(500).json(errResponse("E-SERVER-001"));
+  }
+});
 
 app.post("/make", async (req, res) => {
+  const ip = getClientIp(req);
+  const rl = rateLimitCheck(ip);
+  if (!rl.ok) return res.status(429).json(errResponse(rl.code));
+
   try {
-    const country = (req.body?.country === "JP") ? "JP" : "KR";
-    const minutes = clamp(Number(req.body?.minutes || 1), 1, MAX_MINUTES);
+    const topic = String(req.body?.topic || "").slice(0, 200);
+    const presetRaw = String(req.body?.preset || "CALM_LOOP").toUpperCase();
+    const preset =
+      presetRaw === "UPBEAT_SHORTS" ? "UPBEAT_SHORTS" :
+      presetRaw === "DOCUMENTARY" ? "DOCUMENTARY" : "CALM_LOOP";
 
-    const recipe = await fetchSoundRecipe({ country, minutes });
-    const { wav, license_proof } = synthWav({ country, minutes, recipe });
+    let durationSec = parseInt(req.body?.duration_sec || "90", 10);
+    if (!Number.isFinite(durationSec) || durationSec <= 0) durationSec = 90;
 
-    // license proof는 헤더로도 남김(짧게)
-    res.setHeader("x-audioflow-proof", license_proof.wav_sha256.slice(0, 16));
-    res.setHeader("content-type", "audio/wav");
-    res.setHeader("content-disposition", `attachment; filename="audioflow_${country}_${minutes}m.wav"`);
-    res.setHeader("cache-control", "no-store");
-    res.status(200).send(wav);
-  } catch (e) {
-    res.status(500).send(String(e?.message || e));
-  }
-});
+    // cap duration
+    const cap = Math.max(10, Math.floor(MAX_MINUTES * 60));
+    durationSec = Math.min(durationSec, cap);
 
-app.get("/proof", async (req, res) => {
-  // 최근 증빙은 서버 저장을 안 하므로, “어떻게 생성되는지” 정책만 노출
-  res.json({
-    engine: "AudioFlow v1",
-    policy: {
-      no_melody: true,
-      purpose: "revenue-video background component",
-      stack: "ChatGPT → GitHub → Render → OpenAI API(recipe JSON) → Render WAV"
+    // 1) OpenAI로 "플랜(JSON)"만 생성 (서비스 흔들림 방지)
+    let plan;
+    try {
+      plan = await makeMusicPlan({ topic, preset, durationSec });
+    } catch (e) {
+      // OpenAI 실패해도 서비스는 유지: plan fallback
+      plan = {
+        title: `AudioFlow BGM: ${topic || "Untitled"}`,
+        preset,
+        duration_sec: durationSec,
+        loopable: preset !== "UPBEAT_SHORTS",
+        prompt: {
+          topic: topic || "",
+          mood: preset === "UPBEAT_SHORTS" ? "energetic, light, positive" : "calm, steady, unobtrusive",
+          tempo_bpm: preset === "UPBEAT_SHORTS" ? 110 : 80,
+          instruments: preset === "UPBEAT_SHORTS" ? ["soft pluck", "light percussion", "bass pad"] : ["warm pad", "soft piano", "air texture"],
+          do_not: ["no artist imitation", "no recognizable melodies", "no lyrics", "no harsh distortion"],
+        },
+        notes: [`OpenAI failed -> fallback plan. (${String(e?.message || "").slice(0, 80)})`],
+      };
     }
-  });
+
+    // 2) 서버에서 WAV 합성 (외부 의존성 없이 안정적으로)
+    const { sampleRate, samples } = synthAmbientWav({ durationSec, preset });
+
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15);
+    const fileName = `audioflow_${stamp}_${crypto.randomBytes(3).toString("hex")}.wav`;
+    const fullPath = path.join(OUT_DIR, fileName);
+    writeWavMono16(fullPath, sampleRate, samples);
+
+    // 3) 고정 스키마로 응답
+    const data = emptyData();
+    data.title = String(plan?.title || `AudioFlow BGM: ${topic || "Untitled"}`).slice(0, 120);
+    data.preset = preset;
+    data.duration_sec = durationSec;
+    data.loopable = preset !== "UPBEAT_SHORTS";
+    data.prompt.topic = topic;
+    data.prompt.mood = String(plan?.prompt?.mood || "").slice(0, 80);
+    data.prompt.tempo_bpm = Number(plan?.prompt?.tempo_bpm || (preset === "UPBEAT_SHORTS" ? 110 : 80)) || 80;
+    data.prompt.instruments = Array.isArray(plan?.prompt?.instruments) ? plan.prompt.instruments.slice(0, 8) : [];
+    data.prompt.do_not = Array.isArray(plan?.prompt?.do_not) ? plan.prompt.do_not.slice(0, 8) : [];
+
+    data.audio.format = "wav";
+    data.audio.sample_rate = 44100;
+    data.audio.bitrate_kbps = 1411;
+    data.audio.file_name = fileName;
+    data.audio.download_url = `/download/${fileName}`;
+    data.notes = Array.isArray(plan?.notes) ? plan.notes.slice(0, 6) : [];
+
+    return res.json(okResponse(data));
+  } catch (e) {
+    // 최종 보호: 어떤 예외든 고정 스키마로만 반환
+    return res.status(500).json(errResponse("E-SERVER-001"));
+  }
 });
 
+// ---------- Start ----------
 app.listen(PORT, () => {
-  console.log("AudioFlow live on port", PORT);
-  if (!OPENAI_API_KEY) {
-    console.log("WARNING: OPENAI_API_KEY is not set. Using fallback recipe (still generates WAV).");
-  }
+  console.log(`AudioFlow Engine v1 listening on :${PORT}`);
 });
