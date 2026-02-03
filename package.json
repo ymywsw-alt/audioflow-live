@@ -2,16 +2,12 @@
   "name": "audioflow-live",
   "version": "1.0.0",
   "private": true,
-  "description": "AudioFlow v1 - revenue-video background audio engine (KR/JP) on Render",
+  "type": "module",
   "main": "server.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.2"
-  },
-  "engines": {
-    "node": ">=18"
   }
 }
